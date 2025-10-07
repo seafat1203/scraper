@@ -1,0 +1,112 @@
+name: Run Scraper (auto-detect py/exe)
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 7 * * 1-5"   # 工作日 07:00 UTC（夏令时≈巴黎09:00）
+
+jobs:
+  run:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 如 exe 需要浏览器可保留；不需要可删掉
+      - name: Install Google Chrome (optional)
+        shell: pwsh
+        run: |
+          choco install googlechrome -y || echo "Chrome install skipped"
+
+      - name: Run scraper (auto-detect)
+        shell: pwsh
+        env:
+          EXE_PATH: ${{ vars.EXE_PATH }}   # 如想固定 exe 路径（例如 dist\scraper.exe），在仓库 Variables 里设置
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path output | Out-Null
+
+          # 1) 如果显式给了 EXE_PATH，就直接跑 exe
+          if ($env:EXE_PATH -and (Test-Path $env:EXE_PATH)) {
+            Write-Host "Use explicit exe: $env:EXE_PATH"
+            & "$env:EXE_PATH"
+            if ($LASTEXITCODE -ne 0) { throw "EXE exited with code $LASTEXITCODE" }
+          }
+          else {
+            # 2) 优先递归查找 Python 脚本（跳过 .git/chromedriver/output/venv）
+            $py = Get-ChildItem -Recurse -File -Include *.py |
+                    Where-Object {
+                      $_.FullName -notmatch '\\\.git\\' -and
+                      $_.FullName -notmatch '\\chromedriver\\' -and
+                      $_.FullName -notmatch '\\output\\' -and
+                      $_.FullName -notmatch '\\venv\\'
+                    } | Select-Object -First 1
+
+            if ($py) {
+              Write-Host "Detected python entry: $($py.FullName)"
+              # 安装依赖（兼容 requirement.txt / requirements.txt）
+              if (Test-Path "requirement.txt") {
+                python -m pip install --upgrade pip
+                pip install -r requirement.txt
+              } elseif (Test-Path "requirements.txt") {
+                python -m pip install --upgrade pip
+                pip install -r requirements.txt
+              } else {
+                Write-Warning "未找到 requirement(s).txt，跳过依赖安装"
+              }
+              Push-Location $py.DirectoryName
+              python $py.Name
+              $code = $LASTEXITCODE
+              Pop-Location
+              if ($code -ne 0) { throw "Python script exited with code $code" }
+            }
+            else {
+              # 3) 找 exe（排除各类驱动）
+              $exclude = @('chromedriver.exe','msedgedriver.exe','geckodriver.exe','chrome.exe')
+              $exe = Get-ChildItem -Recurse -File -Include *.exe |
+                       Where-Object { $exclude -notcontains $_.Name } |
+                       Select-Object -First 1
+
+              if (-not $exe) {
+                throw "❌ 未找到可运行的入口（*.py 或非驱动 *.exe）"
+              }
+              Write-Host "Detected exe: $($exe.FullName)"
+              & "$($exe.FullName)"
+              if ($LASTEXITCODE -ne 0) { throw "EXE exited with code $LASTEXITCODE" }
+            }
+          }
+
+          # 4) 收集 CSV 到 output/
+          Write-Host "Collecting CSV files to output/ ..."
+          $csvs = Get-ChildItem -Recurse -File -Include *.csv | Where-Object { $_.FullName -notmatch '\\output\\' }
+          if ($csvs) {
+            $csvs | Copy-Item -Destination output -Force
+          } else {
+            Write-Warning "未找到任何 CSV。请确认程序有写出 CSV。"
+          }
+
+      - name: Upload CSV artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-output
+          path: output\*.csv
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload logs (optional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs
+          path: |
+            **\*.log
+            output\*.log
+          if-no-files-found: ignore
+          retention-days: 7
